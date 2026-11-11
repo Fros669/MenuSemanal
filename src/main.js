@@ -73,6 +73,7 @@ let cloudReady = false;
 let cloudSaveTimer = null;
 let authInitialized = false;
 let applyingCloudState = false;
+let realtimeChannel = null;
 
 function servingKey(slot, id) {
   return `${slot}|${id}`;
@@ -300,6 +301,53 @@ async function signOut() {
   }
 }
 
+
+async function subscribeToCloudChanges(user) {
+  if (realtimeChannel) {
+    await supabase.removeChannel(realtimeChannel);
+    realtimeChannel = null;
+  }
+
+  realtimeChannel = supabase
+    .channel(`app-state-${user.id}`)
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "app_state",
+        filter: `user_id=eq.${user.id}`
+      },
+      (payload) => {
+        const remoteState = payload.new?.data;
+
+        if (!remoteState || !Array.isArray(remoteState.recipes)) {
+          return;
+        }
+
+        applyingCloudState = true;
+
+        try {
+          applyAppState(remoteState);
+          localStorage.setItem(
+            STORAGE_KEY,
+            JSON.stringify(getAppState())
+          );
+          render();
+          console.log("Cambios recibidos desde otro dispositivo");
+        } catch (error) {
+          console.error("Error aplicando cambios remotos:", error);
+        } finally {
+          applyingCloudState = false;
+        }
+      }
+    )
+    .subscribe((status) => {
+      console.log("Estado de sincronización en tiempo real:", status);
+    });
+}
+
+
 async function initializeSupabase() {
   const { data, error } = await supabase.auth.getSession();
 
@@ -311,6 +359,7 @@ async function initializeSupabase() {
   if (data.session?.user) {
     currentUser = data.session.user;
     await loadCloudState(currentUser);
+    await subscribeToCloudChanges(currentUser);
   }
 
   authInitialized = true;
@@ -323,8 +372,19 @@ async function initializeSupabase() {
 
     if (currentUser) {
       await loadCloudState(currentUser);
+      await subscribeToCloudChanges(currentUser);
     } else {
       cloudReady = false;
+
+      if (cloudSaveTimer) {
+        clearTimeout(cloudSaveTimer);
+      }
+
+      if (realtimeChannel) {
+        await supabase.removeChannel(realtimeChannel);
+        realtimeChannel = null;
+      }
+
       render();
     }
   });
