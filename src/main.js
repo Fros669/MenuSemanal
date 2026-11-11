@@ -1,9 +1,10 @@
 import * as XLSX from "xlsx";
 import "./style.css";
+import { supabase } from "./supabase.js";
 
 const EXPECTED = [
   "Comida", "Categoría", "Temporada", "Ingredientes", "Calorías",
-  "Proteína (g)", "Carbohidratos (g)", "Grasas (g)", "Notas", "Link a receta"
+  "Proteína (g)", "Carbohidratos (g)", "Grasas (g)", "Notas", "Link a receta", "Receta"
 ];
 const DAYS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
 const MEALS = ["Desayuno", "Comida", "Cena"];
@@ -19,6 +20,18 @@ const app = document.querySelector("#app");
 const escapeHTML = value => String(value ?? "").replace(/[&<>"']/g, ch => ({
   "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
 }[ch]));
+function recipePreparationHTML(value) {
+  return String(value ?? "")
+    .split(/(<br\s*\/?>)/gi)
+    .map(part => {
+      if (/^<br\s*\/?>$/i.test(part)) {
+        return "<br>";
+      }
+
+      return escapeHTML(part);
+    })
+    .join("");
+}
 const normalize = value => String(value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase();
 const num = value => {
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
@@ -54,6 +67,13 @@ let checkedShoppingItems = new Set();
 // Personas asignadas a cada receta dentro de cada franja del menú.
 let recipeServings = {};
 
+// Estado de la conexión con Supabase
+let currentUser = null;
+let cloudReady = false;
+let cloudSaveTimer = null;
+let authInitialized = false;
+let applyingCloudState = false;
+
 function servingKey(slot, id) {
   return `${slot}|${id}`;
 }
@@ -63,20 +83,54 @@ function getServings(slot, id) {
   return Number.isFinite(value) && value >= 1 ? value : 2;
 }
 
+function getAppState() {
+  return {
+    recipes,
+    menu,
+    filters,
+    activeView,
+    weekOffset,
+    checkedShoppingItems: [...checkedShoppingItems],
+    recipeServings
+  };
+}
+
 function saveState() {
+  const state = getAppState();
+
+  // Siempre mantenemos una copia local de seguridad.
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      recipes,
-      menu,
-      filters,
-      activeView,
-      weekOffset,
-      checkedShoppingItems: [...checkedShoppingItems],
-      recipeServings
-    }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   } catch (error) {
     console.warn("No se pudo guardar el estado localmente", error);
   }
+
+  // No sincronizar hasta haber comprobado la sesión y cargado
+  // los datos iniciales de la nube.
+  if (!cloudReady || !currentUser || applyingCloudState) return;
+
+  clearTimeout(cloudSaveTimer);
+
+  cloudSaveTimer = setTimeout(async () => {
+    try {
+      const { error } = await supabase
+        .from("app_state")
+        .upsert({
+          user_id: currentUser.id,
+          data: getAppState(),
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: "user_id"
+        });
+
+      if (error) throw error;
+
+      console.log("Datos sincronizados con Supabase");
+    } catch (error) {
+      console.error("Error sincronizando con Supabase:", error);
+      alert("No se han podido sincronizar los datos. Se conserva la copia local.");
+    }
+  }, 800);
 }
 
 function restoreState() {
@@ -110,6 +164,172 @@ function restoreState() {
   }
 }
 
+function applyAppState(state) {
+  if (!state || typeof state !== "object") return;
+
+  if (Array.isArray(state.recipes)) {
+    recipes = state.recipes;
+  }
+
+  menu = state.menu || {};
+  filters = { ...filters, ...(state.filters || {}) };
+
+  activeView = ["week", "recipes", "about", "shopping"]
+    .includes(state.activeView) ? state.activeView : "week";
+
+  weekOffset = Number.isFinite(state.weekOffset)
+    ? state.weekOffset : 0;
+
+  checkedShoppingItems = new Set(
+    state.checkedShoppingItems || []
+  );
+
+  recipeServings = state.recipeServings || {};
+}
+
+async function loadCloudState(user) {
+  cloudReady = false;
+
+  try {
+    const { data, error } = await supabase
+      .from("app_state")
+      .select("data")
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    const localRaw = localStorage.getItem(STORAGE_KEY);
+    const localState = localRaw ? JSON.parse(localRaw) : null;
+
+    if (data?.data) {
+      // Si ya existen datos en la nube, tienen prioridad.
+      applyingCloudState = true;
+      applyAppState(data.data);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(getAppState()));
+      applyingCloudState = false;
+
+      console.log("Datos recuperados de Supabase");
+    } else {
+      // Si la nube está vacía, conservamos y subimos los datos locales.
+      if (localState?.recipes?.length) {
+        applyAppState(localState);
+      }
+
+      const { error: uploadError } = await supabase
+        .from("app_state")
+        .upsert({
+          user_id: user.id,
+          data: getAppState(),
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: "user_id"
+        });
+
+      if (uploadError) throw uploadError;
+
+      console.log("Datos locales migrados a Supabase");
+    }
+
+    cloudReady = true;
+    render();
+
+  } catch (error) {
+    applyingCloudState = false;
+    cloudReady = false;
+    console.error("Error cargando datos de Supabase:", error);
+
+    alert("No se han podido recuperar los datos de la nube. Tus datos locales se mantienen.");
+  }
+}
+
+
+async function signIn() {
+  const email = app.querySelector("#auth-email")?.value.trim();
+  const password = app.querySelector("#auth-password")?.value;
+
+  if (!email || !password) {
+    alert("Introduce tu correo electrónico y contraseña.");
+    return;
+  }
+
+  const { error } = await supabase.auth.signInWithPassword({
+    email,
+    password
+  });
+
+  if (error) {
+    alert("No se ha podido iniciar sesión: " + error.message);
+  }
+}
+
+async function signUp() {
+  const email = app.querySelector("#auth-email")?.value.trim();
+  const password = app.querySelector("#auth-password")?.value;
+
+  if (!email || !password) {
+    alert("Introduce tu correo electrónico y contraseña.");
+    return;
+  }
+
+  if (password.length < 6) {
+    alert("La contraseña debe tener al menos 6 caracteres.");
+    return;
+  }
+
+  const { data, error } = await supabase.auth.signUp({
+    email,
+    password
+  });
+
+  if (error) {
+    alert("No se ha podido crear la cuenta: " + error.message);
+    return;
+  }
+
+  if (!data.session) {
+    alert("Cuenta creada. Revisa tu correo para confirmar el registro y después inicia sesión.");
+  }
+}
+
+async function signOut() {
+  const { error } = await supabase.auth.signOut();
+
+  if (error) {
+    alert("No se ha podido cerrar sesión: " + error.message);
+  }
+}
+
+async function initializeSupabase() {
+  const { data, error } = await supabase.auth.getSession();
+
+  if (error) {
+    console.error("Error comprobando la sesión:", error);
+    return;
+  }
+
+  if (data.session?.user) {
+    currentUser = data.session.user;
+    await loadCloudState(currentUser);
+  }
+
+  authInitialized = true;
+  render();
+
+  supabase.auth.onAuthStateChange(async (event, session) => {
+    if (event === "INITIAL_SESSION") return;
+
+    currentUser = session?.user || null;
+
+    if (currentUser) {
+      await loadCloudState(currentUser);
+    } else {
+      cloudReady = false;
+      render();
+    }
+  });
+}
+
 function parseRow(row, id) {
   const normalized = {};
   for (const [key, value] of Object.entries(row)) normalized[normalize(key)] = value;
@@ -118,7 +338,7 @@ function parseRow(row, id) {
     return "";
   };
   const item = {
-    "Comida": find(["Comida", "Nombre", "Receta"]),
+    "Comida": find(["Comida", "Nombre"]),
     "Categoría": find(["Categoría", "Categoria"]),
     "Temporada": find(["Temporada"]),
     "Ingredientes": find(["Ingredientes"]),
@@ -128,6 +348,7 @@ function parseRow(row, id) {
     "Grasas (g)": num(find(["Grasas (g)", "Grasas"])),
     "Notas": find(["Notas", "Notas (ej. vegano, sin gluten, etc.)", "Etiquetas"]),
     "Link a receta": find(["Link a receta", "Link receta", "URL", "Receta URL"]),
+    "Receta": find(["Receta","Elaboración","Elaboracion","Preparación","Preparacion"]),
     __id: id
   };
   return item;
@@ -352,7 +573,7 @@ function allUnique(key) {
 function filteredRecipes() {
   const q = normalize(filters.search);
   return recipes.filter(r => {
-    const searchable = normalize([r["Comida"], r["Ingredientes"], r["Notas"], r["Categoría"], r["Temporada"]].join(" "));
+    const searchable = normalize([r["Comida"],r["Ingredientes"],r["Notas"],r["Categoría"],r["Temporada"],r["Receta"]].join(" "));
     return (!filters.category || normalize(r["Categoría"]) === normalize(filters.category))
       && (!filters.season || normalize(r["Temporada"]) === normalize(filters.season))
       && (!filters.calories || num(r["Calorías"]) <= num(filters.calories))
@@ -379,16 +600,70 @@ function nutrition(recipe) {
   </div>`;
 }
 function recipeCard(recipe, compact = false) {
-  const tags = String(recipe["Notas"] || "").split(/[,;|]/).map(s => s.trim()).filter(Boolean).slice(0, 3);
+  const tags = String(recipe["Notas"] || "")
+    .split(/[,;|]/)
+    .map(s => s.trim())
+    .filter(Boolean)
+    .slice(0, 3);
+
+  const hasPreparation = String(recipe["Receta"] || "").trim().length > 0;
+
   return `<article class="recipe-card ${compact ? "compact" : ""}">
-    <div class="recipe-title">${escapeHTML(recipe["Comida"] || "Receta sin nombre")}</div>
-    <div class="recipe-meta">${escapeHTML(recipe["Categoría"] || "Sin categoría")} · ${escapeHTML(recipe["Temporada"] || "Temporada no indicada")}</div>
-    ${recipe["Ingredientes"] ? `<p class="ingredients">${escapeHTML(recipe["Ingredientes"])}</p>` : ""}
+    <div class="recipe-title">
+      ${escapeHTML(recipe["Comida"] || "Receta sin nombre")}
+    </div>
+
+    <div class="recipe-meta">
+      ${escapeHTML(recipe["Categoría"] || "Sin categoría")} ·
+      ${escapeHTML(recipe["Temporada"] || "Temporada no indicada")}
+    </div>
+
+    ${recipe["Ingredientes"]
+      ? `<p class="ingredients">${escapeHTML(recipe["Ingredientes"])}</p>`
+      : ""}
+
     ${nutrition(recipe)}
-    ${tags.length ? `<div class="tags">${tags.map(t => `<span class="tag">${escapeHTML(t)}</span>`).join("")}</div>` : ""}
+
+    ${tags.length
+      ? `<div class="tags">${tags.map(t =>
+          `<span class="tag">${escapeHTML(t)}</span>`
+        ).join("")}</div>`
+      : ""}
+
     <div class="card-actions">
-      ${recipe["Link a receta"] && /^https?:\/\//i.test(String(recipe["Link a receta"])) ? `<a class="text-link" href="${escapeHTML(recipe["Link a receta"])}" target="_blank" rel="noopener noreferrer">Ver receta ↗</a>` : `<span class="muted small">Sin enlace</span>`}
-      ${selectedSlot ? `<button class="btn btn-primary btn-small" data-add="${recipeId(recipe)}">Añadir aquí</button>` : ""}
+      <div class="recipe-card-links">
+        ${
+          recipe["Link a receta"] &&
+          /^https?:\/\//i.test(String(recipe["Link a receta"]))
+            ? `<a class="text-link"
+                 href="${escapeHTML(recipe["Link a receta"])}"
+                 target="_blank"
+                 rel="noopener noreferrer">
+                 Ver receta ↗
+               </a>`
+            : `<span class="muted small">Sin enlace</span>`
+        }
+
+        ${
+          hasPreparation
+            ? `<button
+                type="button"
+                class="text-link preparation-link"
+                data-recipe-modal="${escapeHTML(recipeId(recipe))}">
+                Ver elaboración
+              </button>`
+            : ""
+        }
+      </div>
+
+      ${
+        selectedSlot
+          ? `<button class="btn btn-primary btn-small"
+               data-add="${escapeHTML(recipeId(recipe))}">
+               Añadir aquí
+             </button>`
+          : ""
+      }
     </div>
   </article>`;
 }
@@ -741,12 +1016,94 @@ function renderShoppingList() {
     </section>
   `;
 }
+function recipeModalMarkup() {
+  return `
+    <div
+      class="recipe-modal"
+      id="recipe-modal"
+      hidden
+      aria-hidden="true"
+    >
+      <div
+        class="recipe-modal-backdrop"
+        data-close-recipe-modal
+      ></div>
 
+      <section
+        class="recipe-modal-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="recipe-modal-title"
+        tabindex="-1"
+      >
+        <header class="recipe-modal-header">
+          <h2 id="recipe-modal-title">Elaboración</h2>
+
+          <button
+            type="button"
+            class="recipe-modal-close"
+            data-close-recipe-modal
+            aria-label="Cerrar elaboración"
+          >
+            ×
+          </button>
+        </header>
+
+        <div
+          class="recipe-modal-content"
+          id="recipe-modal-content"
+        ></div>
+      </section>
+    </div>
+  `;
+}
 function render() {
   const categories = allUnique("Categoría"), seasons = allUnique("Temporada");
   app.innerHTML = `<div class="app-shell">
     <aside class="left-nav">
       <div class="brand"><div class="brand-mark">♧</div><div><strong>Mis Recetas</strong><span>Planificador semanal</span></div></div>
+      <div class="auth-panel">
+  ${
+    currentUser
+      ? `
+        <p class="auth-status">☁️ Sincronización activa</p>
+        <p class="auth-email">${escapeHTML(currentUser.email)}</p>
+        <button class="btn btn-quiet" id="logout-button">
+          Cerrar sesión
+        </button>
+      `
+      : `
+        <strong>Sincroniza tus recetas</strong>
+        <p class="muted small">
+          Inicia sesión para acceder desde otros dispositivos.
+        </p>
+        <label>
+          Correo electrónico
+          <input
+            id="auth-email"
+            type="email"
+            placeholder="tu@email.com"
+            autocomplete="email"
+          >
+        </label>
+        <label>
+          Contraseña
+          <input
+            id="auth-password"
+            type="password"
+            placeholder="Contraseña"
+            autocomplete="current-password"
+          >
+        </label>
+        <button class="btn btn-primary" id="login-button">
+          Iniciar sesión
+        </button>
+        <button class="btn btn-quiet" id="signup-button">
+          Crear cuenta
+        </button>
+      `
+  }
+</div>
       <nav>
         <button class="nav-item ${activeView === "week" ? "active" : ""}" data-view="week">▦ <span>Menú semanal</span></button>
         <button class="nav-item ${activeView === "recipes" ? "active" : ""}" data-view="recipes">⌕ <span>Todas las recetas</span></button>
@@ -803,7 +1160,8 @@ function render() {
         <div id="recipe-area">${selectedSlot || activeView === "recipes" ? renderRecipeList() : ""}</div>
       </section>${renderSidebar()}</div>`}
     </main>
-  </div>`;
+  </div>
+  ${recipeModalMarkup()}`;
   bindEvents();
   saveState();
 }
@@ -812,6 +1170,73 @@ function resetFilters() {
   render();
 }
 function bindEvents() {
+    // Ventana de elaboración de recetas.
+  const recipeModal = app.querySelector("#recipe-modal");
+  const recipeModalTitle = app.querySelector("#recipe-modal-title");
+  const recipeModalContent = app.querySelector("#recipe-modal-content");
+  const recipeModalDialog = recipeModal?.querySelector(".recipe-modal-dialog");
+
+  let previousModalFocus = null;
+
+  function closeRecipeModal() {
+    if (!recipeModal || recipeModal.hidden) return;
+
+    recipeModal.hidden = true;
+    recipeModal.setAttribute("aria-hidden", "true");
+    document.body.classList.remove("recipe-modal-open");
+
+    if (previousModalFocus?.isConnected) {
+      previousModalFocus.focus();
+    }
+
+    previousModalFocus = null;
+  }
+
+  app.querySelectorAll("[data-recipe-modal]").forEach(button => {
+    button.addEventListener("click", () => {
+      const id = button.dataset.recipeModal;
+
+      const recipe = recipes.find(
+        item => recipeId(item) === String(id)
+      );
+
+      if (!recipe || !recipeModal) return;
+
+      previousModalFocus = button;
+
+      recipeModalTitle.textContent =
+        recipe["Comida"] || "Elaboración";
+
+      recipeModalContent.innerHTML =
+        recipePreparationHTML(recipe["Receta"]);
+
+      recipeModal.hidden = false;
+      recipeModal.setAttribute("aria-hidden", "false");
+
+      document.body.classList.add("recipe-modal-open");
+
+      recipeModalDialog?.focus();
+    });
+  });
+
+  recipeModal?.querySelectorAll("[data-close-recipe-modal]")
+    .forEach(button => {
+      button.addEventListener("click", closeRecipeModal);
+    });
+
+  recipeModal?.addEventListener("click", event => {
+    if (event.target === recipeModal) {
+      closeRecipeModal();
+    }
+  });
+
+  const handleRecipeModalEscape = event => {
+    if (event.key === "Escape" && recipeModal && !recipeModal.hidden) {
+      closeRecipeModal();
+    }
+  };
+
+  document.addEventListener("keydown", handleRecipeModalEscape);
   const connectDriveButton = app.querySelector("#connect-drive");
 if (connectDriveButton) {
   connectDriveButton.addEventListener("click", connectGoogleDrive);
@@ -935,6 +1360,10 @@ app.querySelectorAll("[data-servings-change]").forEach(button => {
   uploadPanel?.addEventListener("dragover", e => { e.preventDefault(); uploadPanel.classList.add("dragging"); });
   uploadPanel?.addEventListener("dragleave", () => uploadPanel.classList.remove("dragging"));
   uploadPanel?.addEventListener("drop", async e => { e.preventDefault(); uploadPanel.classList.remove("dragging"); const file = e.dataTransfer.files?.[0]; if (file) await loadFile(file); });
+  app.querySelector("#login-button")?.addEventListener("click", signIn);
+  app.querySelector("#signup-button")?.addEventListener("click", signUp);
+  app.querySelector("#logout-button")?.addEventListener("click", signOut);
+
 }
 async function loadFile(file) {
   if (!/\.(xlsx|xls|csv)$/i.test(file.name)) { alert("Selecciona un archivo .xlsx, .xls o .csv."); return; }
@@ -996,7 +1425,7 @@ function exportMenu() {
         Día: day, Momento: meal, Comida: r["Comida"], Categoría: r["Categoría"], Temporada: r["Temporada"],
         Ingredientes: r["Ingredientes"], Calorías: r["Calorías"], "Proteína (g)": r["Proteína (g)"],
         "Carbohidratos (g)": r["Carbohidratos (g)"], "Grasas (g)": r["Grasas (g)"],
-        Notas: r["Notas"], "Link a receta": r["Link a receta"]
+        Notas: r["Notas"],"Link a receta": r["Link a receta"],Receta: r["Receta"]
       });
     });
   }));
@@ -1010,3 +1439,4 @@ if (!restoreState()) {
 }
 
 render();
+initializeSupabase();
