@@ -32,8 +32,13 @@ function recipePreparationHTML(value) {
     })
     .join("");
 }
-const normalize = value => String(value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase();
-const num = value => {
+const normalize = value => String(value ?? "")
+  .normalize("NFD")
+  .replace(/[\u0300-\u036f]/g, "")
+  .replace(/\s+/g, " ")
+  .trim()
+  .toLowerCase();
+  const num = value => {
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
   const parsed = Number(String(value ?? "").replace(",", ".").replace(/[^\d.-]/g, ""));
   return Number.isFinite(parsed) ? parsed : 0;
@@ -67,6 +72,20 @@ let checkedShoppingItems = new Set();
 // Personas asignadas a cada receta dentro de cada franja del menú.
 let recipeServings = {};
 
+let generatedMenu = null;
+
+let lockedRecipes = new Set();
+
+// Preferencias del generador automático de menús.
+let generatorSettings = {
+  maxCalories: 2000,
+  season: "auto",
+  prioritizeProtein: false,
+  balanceMacros: true,
+  avoidRepeats: true,
+  useCommonIngredients: true
+};
+
 // Estado de la conexión con Supabase
 let currentUser = null;
 let cloudReady = false;
@@ -92,7 +111,10 @@ function getAppState() {
     activeView,
     weekOffset,
     checkedShoppingItems: [...checkedShoppingItems],
-    recipeServings
+    recipeServings,
+    generatorSettings,
+    generatedMenu,
+    lockedRecipes: [...lockedRecipes]
   };
 }
 
@@ -126,9 +148,9 @@ function saveState() {
 
       if (error) throw error;
 
-      console.log("Datos sincronizados con Supabase");
+      //console.log("Datos sincronizados");
     } catch (error) {
-      console.error("Error sincronizando con Supabase:", error);
+      console.error("Error sincronizando:", error);
       alert("No se han podido sincronizar los datos. Se conserva la copia local.");
     }
   }, 800);
@@ -148,7 +170,7 @@ function restoreState() {
     recipes = state.recipes;
     menu = state.menu || {};
     filters = { ...filters, ...(state.filters || {}) };
-    activeView = ["week", "recipes", "about", "shopping"]
+    activeView = ["week", "recipes", "about", "shopping", "generator"]
       .includes(state.activeView) ? state.activeView : "week";
     weekOffset = Number.isFinite(state.weekOffset)
       ? state.weekOffset : 0;
@@ -157,6 +179,12 @@ function restoreState() {
       state.checkedShoppingItems || []
     );
     recipeServings = state.recipeServings || {};
+    generatedMenu = state.generatedMenu || null;
+    lockedRecipes = new Set(state.lockedRecipes || []);
+    generatorSettings = {
+      ...generatorSettings,
+      ...(state.generatorSettings || {})
+    };
 
     return true;
   } catch (error) {
@@ -175,7 +203,7 @@ function applyAppState(state) {
   menu = state.menu || {};
   filters = { ...filters, ...(state.filters || {}) };
 
-  activeView = ["week", "recipes", "about", "shopping"]
+  activeView = ["week", "recipes", "about", "shopping", "generator"]
     .includes(state.activeView) ? state.activeView : "week";
 
   weekOffset = Number.isFinite(state.weekOffset)
@@ -186,6 +214,12 @@ function applyAppState(state) {
   );
 
   recipeServings = state.recipeServings || {};
+  generatedMenu = state.generatedMenu || null;
+  lockedRecipes = new Set(state.lockedRecipes || []);
+    generatorSettings = {
+    ...generatorSettings,
+    ...(state.generatorSettings || {})
+  };
 }
 
 async function loadCloudState(user) {
@@ -210,7 +244,7 @@ async function loadCloudState(user) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(getAppState()));
       applyingCloudState = false;
 
-      console.log("Datos recuperados de Supabase");
+      //console.log("Datos recuperados de Supabase");
     } else {
       // Si la nube está vacía, conservamos y subimos los datos locales.
       if (localState?.recipes?.length) {
@@ -334,7 +368,7 @@ async function subscribeToCloudChanges(user) {
             JSON.stringify(getAppState())
           );
           render();
-          console.log("Cambios recibidos desde otro dispositivo");
+          //console.log("Cambios recibidos desde otro dispositivo");
         } catch (error) {
           console.error("Error aplicando cambios remotos:", error);
         } finally {
@@ -343,7 +377,7 @@ async function subscribeToCloudChanges(user) {
       }
     )
     .subscribe((status) => {
-      console.log("Estado de sincronización en tiempo real:", status);
+      //console.log("Estado de sincronización en tiempo real:", status);
     });
 }
 
@@ -859,59 +893,113 @@ function renderSidebar() {
   </aside>`;
 }
 
+
+
 function parseIngredient(raw, servings = 2) {
   const label = String(raw || "").trim().replace(/\s+/g, " ");
   if (!label) return null;
 
-  // Ejemplos: "patata: 3 unidades", "nata: 15 ml".
-  const match = label.match(
-    /^(.+?)\s*:\s*(-?\d+(?:[.,]\d+)?)\s*([a-zA-ZáéíóúÁÉÍÓÚñÑ]+)?$/
+  // Reconocer cantidades: 1, 0.5, 0,5, 1/2, 1/4...
+  const quantityMatch = label.match(
+    /^(\d+(?:[.,]\d+)?|\d+\s*\/\s*\d+)\s+(.+)$/i
   );
 
-  if (!match) {
-    return { label, amount: null, unit: "", count: 1 };
-  }
-
-  const name = match[1].trim();
-  const perPerson = Number(match[2].replace(",", "."));
-  let unit = (match[3] || "").toLowerCase();
-
-  if (!name || !Number.isFinite(perPerson) || perPerson < 0) {
-    return { label, amount: null, unit: "", count: 1 };
-  }
-
-  if (["kg", "kilo", "kilos", "kilogramo", "kilogramos"].includes(unit)) {
+  if (!quantityMatch) {
     return {
-      label: name,
-      amount: perPerson * 1000 * servings,
-      unit: "g",
+      label,
+      amount: null,
+      unit: "",
       count: 1
     };
   }
 
-  if (["l", "lt", "litro", "litros"].includes(unit)) {
-    return {
-      label: name,
-      amount: perPerson * 1000 * servings,
-      unit: "ml",
-      count: 1
-    };
+  let amountText = quantityMatch[1].replace(",", ".");
+  let amount;
+
+  if (amountText.includes("/")) {
+    const parts = amountText.split("/");
+    amount = Number(parts[0]) / Number(parts[1]);
+  } else {
+    amount = Number(amountText);
   }
 
-  if (["gr", "grs", "gramo", "gramos"].includes(unit)) unit = "g";
-  if (["mililitro", "mililitros", "cc"].includes(unit)) unit = "ml";
+  if (!Number.isFinite(amount) || amount < 0) return null;
 
-  if (["unidad", "unidades", "ud", "uds"].includes(unit)) {
-    unit = "unidades";
+  let rest = quantityMatch[2].trim();
+
+  // Reconocer unidades y convertirlas a nombres normalizados.
+  const unitMatch = rest.match(
+    /^(kg|kilos?|kilogramos?|g|gr|grs|gramos?|ml|mililitros?|cc|l|lt|litros?|unidades?|ud|uds|sobres?|paquetes?|dientes?|cucharaditas?|cucharadas?|manojos?|rulos?|latas?|huevos?)\s+(?:de\s+)?(.+)$/i
+  );
+
+  let unit = "unidades";
+  let name = rest;
+
+  if (unitMatch) {
+    unit = unitMatch[1].toLowerCase();
+    name = unitMatch[2].trim();
+  }
+
+  const unitAliases = {
+    kg: "g",
+    kilo: "g",
+    kilos: "g",
+    kilogramo: "g",
+    kilogramos: "g",
+    gr: "g",
+    grs: "g",
+    gramo: "g",
+    gramos: "g",
+    mililitro: "ml",
+    mililitros: "ml",
+    cc: "ml",
+    l: "ml",
+    lt: "ml",
+    litro: "ml",
+    litros: "ml",
+    unidad: "unidades",
+    unidades: "unidades",
+    ud: "unidades",
+    uds: "unidades",
+    sobre: "sobres",
+    sobres: "sobres",
+    paquete: "paquetes",
+    paquetes: "paquetes",
+    diente: "dientes",
+    dientes: "dientes",
+    cucharadita: "cucharaditas",
+    cucharaditas: "cucharaditas",
+    cucharada: "cucharadas",
+    cucharadas: "cucharadas",
+    manojo: "manojos",
+    manojos: "manojos",
+    rulo: "rulos",
+    rulos: "rulos",
+    lata: "latas",
+    latas: "latas",
+    huevo: "huevos",
+    huevos: "huevos"
+  };
+
+  unit = unitAliases[unit] || unit;
+
+  if (unit === "g" && ["kg"].includes(unitMatch?.[1]?.toLowerCase())) {
+    amount *= 1000;
+  }
+
+  if (unit === "ml" && ["l", "lt", "litro", "litros"].includes(unitMatch?.[1]?.toLowerCase())) {
+    amount *= 1000;
   }
 
   return {
     label: name,
-    amount: perPerson * servings,
+    amount: amount * servings,
     unit,
     count: 1
   };
 }
+
+
 
 function buildShoppingItems() {
   const counts = new Map();
@@ -978,6 +1066,678 @@ function formatQuantity(item) {
     : String(Number(item.amount.toFixed(2)));
 
   return `${amount}${item.unit ? ` ${item.unit}` : ""}`;
+}
+
+function getGeneratorRecipes() {
+  const currentMonth = new Date().getMonth();
+
+  const currentSeason =
+    currentMonth >= 2 && currentMonth <= 4 ? "Primavera" :
+    currentMonth >= 5 && currentMonth <= 7 ? "Verano" :
+    currentMonth >= 8 && currentMonth <= 10 ? "Otoño" :
+    "Invierno";
+
+  const selectedSeason =
+    generatorSettings.season === "auto"
+      ? currentSeason
+      : generatorSettings.season;
+      
+
+  return recipes.filter(recipe => {
+    const calories = Number(recipe["Calorías"]);
+
+    // Excluir recetas sin calorías válidas.
+    if (!Number.isFinite(calories) || calories <= 0) return false;
+
+    // Comprobar temporada sin excluir recetas de todo el año.
+    const recipeSeason = String(recipe["Temporada"] || "")
+      .toLowerCase()
+      .trim();
+
+    if (
+      selectedSeason !== "Todo el año" &&
+      recipeSeason &&
+      recipeSeason !== "todo el año" &&
+      !recipeSeason.includes(selectedSeason.toLowerCase())
+    ) {
+      return false;
+    }
+
+        return true;
+      });
+      
+}
+
+function getRecipesByMealType(type) {
+  const available = getGeneratorRecipes();
+
+  if (type === "desayuno") {
+    return available.filter(recipe =>
+      recipe["Categoría"] === "Desayuno"
+    );
+  }
+
+  if (type === "comida") {
+    return available.filter(recipe =>
+      recipe["Categoría"] === "Comida"
+    );
+  }
+
+  if (type === "cena") {
+    return available.filter(recipe =>
+      recipe["Categoría"] === "Cena"
+    );
+  }
+
+  return [];
+}
+
+
+function generateDayMenu(usedRecipes = new Set(), lockedMeals = {}) {
+  const breakfasts = getRecipesByMealType("desayuno");
+  const lunches = getRecipesByMealType("comida");
+  const dinners = getRecipesByMealType("cena");
+
+  if (!breakfasts.length || !lunches.length || !dinners.length) {
+    return null;
+  }
+
+  const maxCalories = Number(generatorSettings.maxCalories) || 2000;
+
+  const shuffle = array => [...array].sort(() => Math.random() - 0.5);
+
+  const breakfastOptions = lockedMeals.desayuno
+    ? [lockedMeals.desayuno]
+    : shuffle(breakfasts);
+
+  const lunchOptions = lockedMeals.comida
+    ? [lockedMeals.comida]
+    : shuffle(lunches);
+
+  const dinnerOptions = lockedMeals.cena
+    ? [lockedMeals.cena]
+    : shuffle(dinners);
+
+  const scoreRecipe = recipe => {
+    let score = 0;
+
+    if (generatorSettings.prioritizeProtein) {
+      score += Number(recipe["Proteína (g)"] || 0) * 2;
+    }
+
+    if (generatorSettings.balanceMacros) {
+      const protein = Number(recipe["Proteína (g)"] || 0);
+      const carbs = Number(recipe["Carbohidratos (g)"] || 0);
+      const fats = Number(recipe["Grasas (g)"] || 0);
+
+      score -= Math.abs(protein - 30) * 0.2;
+      score -= Math.abs(carbs - 40) * 0.1;
+      score -= Math.abs(fats - 15) * 0.1;
+    }
+
+    if (generatorSettings.avoidRepeats && usedRecipes.has(recipe.__id)) {
+      score -= 10000;
+    }
+
+    return score;
+  };
+
+  let bestMenu = null;
+  let bestScore = -Infinity;
+
+  for (const breakfast of breakfastOptions) {
+    for (const lunch of lunchOptions) {
+      for (const dinner of dinnerOptions) {
+        const totalCalories =
+          Number(breakfast["Calorías"]) +
+          Number(lunch["Calorías"]) +
+          Number(dinner["Calorías"]);
+
+        if (totalCalories > maxCalories) continue;
+
+        const score =
+          scoreRecipe(breakfast) +
+          scoreRecipe(lunch) +
+          scoreRecipe(dinner) +
+          Math.random() * 30;
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestMenu = {
+            desayuno: breakfast,
+            comida: lunch,
+            cena: dinner,
+            calories: totalCalories
+          };
+        }
+      }
+    }
+  }
+
+  return bestMenu;
+}
+
+
+function generateWeeklyMenu() {
+  const weeklyMenu = {};
+  const usedRecipes = new Set();
+
+  const days = [
+    "Lunes",
+    "Martes",
+    "Miércoles",
+    "Jueves",
+    "Viernes",
+    "Sábado",
+    "Domingo"
+  ];
+
+  for (const day of days) {
+    const previousDay = generatedMenu?.[day] || {};
+
+    const lockedMeals = {};
+
+    if (lockedRecipes.has(previousDay.desayuno?.["Comida"])) {
+      lockedMeals.desayuno = previousDay.desayuno;
+    }
+
+    if (lockedRecipes.has(previousDay.comida?.["Comida"])) {
+      lockedMeals.comida = previousDay.comida;
+    }
+
+    if (lockedRecipes.has(previousDay.cena?.["Comida"])) {
+      lockedMeals.cena = previousDay.cena;
+    }
+
+    const dayMenu = generateDayMenu(usedRecipes, lockedMeals);
+
+    if (!dayMenu) {
+      return {
+        success: false,
+        message: `No se ha podido encontrar una combinación válida para ${day}. Prueba a aumentar el máximo de calorías diarias o desbloquear alguna receta.`
+      };
+    }
+
+    weeklyMenu[day] = dayMenu;
+
+    if (generatorSettings.avoidRepeats) {
+      usedRecipes.add(dayMenu.desayuno.__id);
+      usedRecipes.add(dayMenu.comida.__id);
+      usedRecipes.add(dayMenu.cena.__id);
+    }
+  }
+
+  return {
+    success: true,
+    menu: weeklyMenu
+  };
+}
+
+
+function regenerateSingleMeal(day, type) {
+  if (!generatedMenu || !generatedMenu[day]) return;
+
+  const currentMeal = generatedMenu[day][type];
+
+  // No permitir cambiar una receta bloqueada.
+  if (lockedRecipes.has(currentMeal["Comida"])) {
+    alert("Esta receta está bloqueada. Desbloquéala antes de cambiarla.");
+    return;
+  }
+
+  const availableRecipes = getRecipesByMealType(type);
+
+  // Calorías de las otras dos comidas del día.
+  const otherCalories =
+    Number(generatedMenu[day].calories) -
+    Number(currentMeal["Calorías"]);
+
+  const maxCalories =
+    Number(generatorSettings.maxCalories) || 2000;
+
+  // Recetas utilizadas en el resto de la semana.
+  const usedRecipes = new Set();
+
+  if (generatorSettings.avoidRepeats) {
+    Object.entries(generatedMenu).forEach(([otherDay, meals]) => {
+      ["desayuno", "comida", "cena"].forEach(mealType => {
+        if (otherDay === day && mealType === type) return;
+
+        usedRecipes.add(meals[mealType].__id);
+      });
+    });
+  }
+
+  // Buscar alternativas válidas.
+  const alternatives = availableRecipes.filter(recipe => {
+    if (recipe["Comida"] === currentMeal["Comida"]) return false;
+
+    if (lockedRecipes.has(recipe["Comida"])) return false;
+
+    if (
+      generatorSettings.avoidRepeats &&
+      usedRecipes.has(recipe.__id)
+    ) {
+      return false;
+    }
+
+    const newTotal =
+      otherCalories + Number(recipe["Calorías"]);
+
+    return newTotal <= maxCalories;
+  });
+
+  if (!alternatives.length) {
+    alert("No hay otra receta disponible que respete el límite de calorías. Prueba a desbloquear alguna receta o aumentar el máximo diario.");
+    return;
+  }
+
+  // Elegir una alternativa aleatoria.
+  const newRecipe =
+    alternatives[Math.floor(Math.random() * alternatives.length)];
+
+  // Actualizar la comida y el total diario.
+  generatedMenu[day][type] = newRecipe;
+
+  generatedMenu[day].calories =
+    otherCalories + Number(newRecipe["Calorías"]);
+  
+  const dayCard = app.querySelector(
+    `[data-generated-day="${day}"]`
+  );
+
+  if (!dayCard) return;
+
+  const mealRow = dayCard.querySelector(
+    `[data-generated-meal="${type}"]`
+  );
+
+  if (!mealRow) return;
+
+  const mealName = mealRow.querySelector(".generated-meal-info strong");
+  const mealCalories = mealRow.querySelector(".generated-meal-calories");
+
+  mealName.textContent = newRecipe["Comida"];
+
+  mealCalories.innerHTML =
+    `${Number(newRecipe["Calorías"]).toLocaleString("es-ES")} <small>kcal</small>`;
+
+  // Actualizar el botón de bloqueo de la nueva receta.
+  const lockButton = mealRow.querySelector("[data-lock-recipe]");
+
+  lockButton.dataset.lockRecipe = newRecipe["Comida"];
+  lockButton.classList.toggle(
+    "locked",
+    lockedRecipes.has(newRecipe["Comida"])
+  );
+  lockButton.textContent = lockedRecipes.has(newRecipe["Comida"])
+    ? "Bloqueada"
+    : "Bloquear";
+
+  // Actualizar las calorías y el progreso del día.
+  const total = generatedMenu[day].calories;
+  const percentage = Math.min((total / maxCalories) * 100, 100);
+  const remaining = maxCalories - total;
+
+  const statusColor = total > maxCalories
+    ? "danger"
+    : percentage >= 95
+      ? "warning"
+      : "success";
+
+  const badge = dayCard.querySelector(".generated-day-badge");
+  badge.className = `generated-day-badge ${statusColor}`;
+  badge.textContent = `${total.toLocaleString("es-ES")} kcal`;
+
+  const progressInfo = dayCard.querySelector(".generated-progress-info strong");
+  progressInfo.textContent = `${percentage.toFixed(1).replace(".", ",")}%`;
+
+  const progressBar = dayCard.querySelector(".generated-progress-bar");
+  progressBar.className = `generated-progress-bar ${statusColor}`;
+  progressBar.style.width = `${percentage}%`;
+
+  const remainingInfo = dayCard.querySelector(".generated-day-remaining span");
+  remainingInfo.textContent = remaining >= 0
+    ? `${remaining.toLocaleString("es-ES")} kcal disponibles`
+    : `${Math.abs(remaining).toLocaleString("es-ES")} kcal por encima del límite`;
+saveState();
+}
+
+
+function regenerateFullDay(day) {
+  if (!generatedMenu || !generatedMenu[day]) return;
+
+  const previousDay = generatedMenu[day];
+  const usedRecipes = new Set();
+
+  // Recopilar las recetas utilizadas en el resto de la semana.
+  if (generatorSettings.avoidRepeats) {
+    Object.entries(generatedMenu).forEach(([otherDay, meals]) => {
+      if (otherDay === day) return;
+
+      ["desayuno", "comida", "cena"].forEach(type => {
+        usedRecipes.add(meals[type].__id);
+      });
+    });
+  }
+
+  // Conservar las comidas bloqueadas.
+  const lockedMeals = {};
+
+  ["desayuno", "comida", "cena"].forEach(type => {
+    if (lockedRecipes.has(previousDay[type]?.["Comida"])) {
+      lockedMeals[type] = previousDay[type];
+    }
+  });
+
+  const newDayMenu = generateDayMenu(usedRecipes, lockedMeals);
+
+  if (!newDayMenu) {
+    alert("No se ha encontrado una combinación válida para este día. Prueba a desbloquear alguna receta o aumentar el máximo de calorías.");
+    return;
+  }
+
+  // Actualizar únicamente el día seleccionado.
+  generatedMenu[day] = newDayMenu;
+
+  const dayCard = app.querySelector(
+    `[data-generated-day="${day}"]`
+  );
+
+  if (!dayCard) return;
+
+  // Actualizar las tres comidas sin sustituir la tarjeta.
+  ["desayuno", "comida", "cena"].forEach(type => {
+    const mealRow = dayCard.querySelector(
+      `[data-generated-meal="${type}"]`
+    );
+
+    if (!mealRow) return;
+
+    const recipe = newDayMenu[type];
+
+    const mealName = mealRow.querySelector(".generated-meal-info strong");
+    const mealCalories = mealRow.querySelector(".generated-meal-calories");
+
+    mealName.textContent = recipe["Comida"];
+
+    mealCalories.innerHTML =
+      `${Number(recipe["Calorías"]).toLocaleString("es-ES")} <small>kcal</small>`;
+
+    const lockButton = mealRow.querySelector("[data-lock-recipe]");
+
+    lockButton.dataset.lockRecipe = recipe["Comida"];
+    lockButton.classList.toggle(
+      "locked",
+      lockedRecipes.has(recipe["Comida"])
+    );
+
+    lockButton.textContent = lockedRecipes.has(recipe["Comida"])
+      ? "Bloqueada"
+      : "Bloquear";
+  });
+
+  // Actualizar calorías y progreso del día.
+  const total = newDayMenu.calories;
+  const dailyLimit = Number(generatorSettings.maxCalories) || 2000;
+  const percentage = Math.min((total / dailyLimit) * 100, 100);
+  const remaining = dailyLimit - total;
+
+  const statusColor = total > dailyLimit
+    ? "danger"
+    : percentage >= 95
+      ? "warning"
+      : "success";
+
+  const badge = dayCard.querySelector(".generated-day-badge");
+  badge.className = `generated-day-badge ${statusColor}`;
+  badge.textContent = `${total.toLocaleString("es-ES")} kcal`;
+
+  const progressInfo = dayCard.querySelector(".generated-progress-info strong");
+  progressInfo.textContent = `${percentage.toFixed(1).replace(".", ",")}%`;
+
+  const progressBar = dayCard.querySelector(".generated-progress-bar");
+  progressBar.className = `generated-progress-bar ${statusColor}`;
+  progressBar.style.width = `${percentage}%`;
+
+  const remainingInfo = dayCard.querySelector(".generated-day-remaining span");
+  remainingInfo.textContent = remaining >= 0
+    ? `${remaining.toLocaleString("es-ES")} kcal disponibles`
+    : `${Math.abs(remaining).toLocaleString("es-ES")} kcal por encima del límite`;
+    saveState();
+}
+
+
+function renderGeneratorPanel() {
+  const availableRecipes = getGeneratorRecipes();
+
+  const seasonOptions = `
+    <option value="auto" ${generatorSettings.season === "auto" ? "selected" : ""}>Automática según la fecha</option>
+    <option value="Primavera" ${generatorSettings.season === "Primavera" ? "selected" : ""}>Primavera</option>
+    <option value="Verano" ${generatorSettings.season === "Verano" ? "selected" : ""}>Verano</option>
+    <option value="Otoño" ${generatorSettings.season === "Otoño" ? "selected" : ""}>Otoño</option>
+    <option value="Invierno" ${generatorSettings.season === "Invierno" ? "selected" : ""}>Invierno</option>
+    <option value="Todo el año" ${generatorSettings.season === "Todo el año" ? "selected" : ""}>Todas las temporadas</option>
+  `;
+
+  const days = [
+    "Lunes", "Martes", "Miércoles", "Jueves",
+    "Viernes", "Sábado", "Domingo"
+  ];
+
+      const menuHTML = generatedMenu
+    ? days.map((day, index) => {
+        const meals = generatedMenu[day];
+        const maxCalories = Number(generatorSettings.maxCalories) || 2000;
+        const total = Number(meals.calories);
+        const percentage = Math.min((total / maxCalories) * 100, 100);
+        const remaining = maxCalories - total;
+
+        const statusColor = total > maxCalories
+          ? "danger"
+          : percentage >= 95
+            ? "warning"
+            : "success";
+
+        return `
+          <div class="generated-day" data-generated-day="${day}">
+            <div class="generated-day-header">
+              <div class="generated-day-name">
+                <span class="generated-day-number">${String(index + 1).padStart(2, "0")}</span>
+                <h3>${day}</h3>
+                <button
+                  type="button"
+                  class="regenerate-day-button"
+                  data-regenerate-full-day="${day}"
+                >
+                  Regenerar día
+                </button>
+              </div>
+              <span class="generated-day-badge ${statusColor}">
+                ${total.toLocaleString("es-ES")} kcal
+              </span>
+            </div>
+
+            <div class="generated-meals-list">
+              ${[
+                ["Desayuno", meals.desayuno],
+                ["Comida", meals.comida],
+                ["Cena", meals.cena]
+              ].map(([type, recipe]) => `
+                <div class="generated-meal" data-generated-meal="${type.toLowerCase()}">>
+                  <span class="generated-meal-icon">
+                    ${type === "Desayuno" ? "D" : type === "Comida" ? "C" : "N"}
+                  </span>
+                  <div class="generated-meal-info">
+                    <span class="generated-meal-type">${type}</span>
+                    <strong>${recipe["Comida"]}</strong>
+                  </div>
+                  <span class="generated-meal-calories">
+                    ${Number(recipe["Calorías"]).toLocaleString("es-ES")} <small>kcal</small>
+                  </span>
+
+                  <button
+                    type="button"
+                    class="lock-recipe-button ${lockedRecipes.has(recipe["Comida"]) ? "locked" : ""}"
+                    data-lock-recipe="${recipe["Comida"]}"
+                  >
+                    ${lockedRecipes.has(recipe["Comida"]) ? "Bloqueada" : "Bloquear"}
+                  </button>
+                  <button
+                    type="button"
+                    class="regenerate-meal-button"
+                    data-regenerate-day="${day}"
+                    data-regenerate-type="${type.toLowerCase()}"
+                  >
+                    Cambiar
+                  </button>
+                </div>
+              `).join("")}
+            </div>
+
+            <div class="generated-day-footer">
+              <div class="generated-progress-info">
+                <span>Consumo diario</span>
+                <strong>${percentage.toFixed(1).replace(".", ",")}%</strong>
+              </div>
+
+              <div class="generated-progress">
+                <div class="generated-progress-bar ${statusColor}"
+                  style="width: ${percentage}%"></div>
+              </div>
+
+              <div class="generated-day-remaining">
+                <span>${remaining >= 0
+                  ? `${remaining.toLocaleString("es-ES")} kcal disponibles`
+                  : `${Math.abs(remaining).toLocaleString("es-ES")} kcal por encima del límite`
+                }</span>
+                <span>Máximo ${maxCalories.toLocaleString("es-ES")} kcal</span>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join("")
+    : "";
+
+  return `
+    <section class="panel generator-panel">
+      <div class="section-title">
+        <div>
+          <h2>Configura tu menú semanal</h2>
+          <p class="muted">
+            Elige tus preferencias y prepara una propuesta para los próximos siete días.
+          </p>
+        </div>
+      </div>
+
+      <div class="generator-settings-grid">
+        <label class="generator-field">
+          <span class="generator-field-title">
+            <span class="generator-field-icon">🔥</span>
+            <span>
+              <strong>Límite diario</strong>
+              <small>Máximo de calorías por persona</small>
+            </span>
+          </span>
+
+          <span class="generator-calories-control">
+            <input id="generator-calories" type="number"
+              min="500" max="10000" step="50"
+              value="${generatorSettings.maxCalories}" />
+            <span>kcal / día</span>
+          </span>
+        </label>
+
+        <label class="generator-field">
+          <span class="generator-field-title">
+            <span class="generator-field-icon">🌿</span>
+            <span>
+              <strong>Temporada</strong>
+              <small>Productos de temporada para tus recetas</small>
+            </span>
+          </span>
+
+          <select id="generator-season" class="generator-season-select">
+            ${seasonOptions}
+          </select>
+        </label>
+      </div>
+
+      <div class="generator-preferences">
+        <h3>Preferencias nutricionales y de variedad</h3>
+
+        <label class="generator-option">
+          <input type="checkbox" id="generator-protein"
+            ${generatorSettings.prioritizeProtein ? "checked" : ""} />
+          <span>
+            <strong>Priorizar proteínas</strong>
+            <small>Dar preferencia a recetas con más proteínas.</small>
+          </span>
+        </label>
+
+        <label class="generator-option">
+          <input type="checkbox" id="generator-macros"
+            ${generatorSettings.balanceMacros ? "checked" : ""} />
+          <span>
+            <strong>Equilibrar macronutrientes</strong>
+            <small>Buscar un reparto equilibrado de proteínas, hidratos y grasas.</small>
+          </span>
+        </label>
+
+        <label class="generator-option">
+          <input type="checkbox" id="generator-repeats"
+            ${generatorSettings.avoidRepeats ? "checked" : ""} />
+          <span>
+            <strong>Evitar repetir recetas</strong>
+            <small>Intentar que no se repitan platos durante la semana.</small>
+          </span>
+        </label>
+
+        <label class="generator-option">
+          <input type="checkbox" id="generator-ingredients"
+            ${generatorSettings.useCommonIngredients ? "checked" : ""} />
+          <span>
+            <strong>Aprovechar ingredientes comunes</strong>
+            <small>Favorecer recetas que compartan ingredientes para simplificar la compra.</small>
+          </span>
+        </label>
+      </div>
+
+      <div class="generator-info">
+        <strong>Plan semanal:</strong>
+        7 días · Desayuno, comida y cena · Valores nutricionales por persona.
+        <div class="generator-available">
+          <strong>${availableRecipes.length}</strong>
+          recetas disponibles para generar tu menú
+        </div>
+      </div>
+
+      <button class="btn btn-primary" id="generate-menu">
+        ✦ Generar menú semanal
+      </button>
+
+      ${generatedMenu ? `
+        <button class="btn btn-primary" id="accept-generated-menu">
+          ✓ Aceptar y añadir al menú semanal
+        </button>
+      ` : ""}
+
+      ${generatedMenu ? `
+        <div class="generated-menu">
+          <div class="section-title">
+            <div>
+              <h2>Tu propuesta semanal</h2>
+              <p class="muted">21 comidas organizadas por días.</p>
+            </div>
+          </div>
+
+          <div class="generated-week">
+            ${menuHTML}
+          </div>
+        </div>
+      ` : ""}
+    </section>
+  `;
 }
 
 function renderShoppingList() {
@@ -1166,6 +1926,7 @@ function render() {
 </div>
       <nav>
         <button class="nav-item ${activeView === "week" ? "active" : ""}" data-view="week">▦ <span>Menú semanal</span></button>
+        <button class="nav-item ${activeView === "generator" ? "active" : ""}" data-view="generator">✦ <span>Generar menú</span></button>
         <button class="nav-item ${activeView === "recipes" ? "active" : ""}" data-view="recipes">⌕ <span>Todas las recetas</span></button>
         <button class="nav-item ${activeView === "shopping" ? "active" : ""}" data-view="shopping">☷ <span>Lista de la compra</span></button>
         <button class="nav-item ${activeView === "about" ? "active" : ""}" data-view="about">ⓘ <span>Acerca de</span></button>
@@ -1193,16 +1954,21 @@ function render() {
     ? "Todas las recetas"
     : activeView === "shopping"
       ? "Lista de la compra"
+      : activeView === "generator"
+        ? "Generar menú semanal"
       : "Acerca de Mis Recetas"}</h1><p>${activeView === "week"
   ? "Encuentra tus platos favoritos y organiza la semana a tu manera."
   : activeView === "recipes"
     ? "Busca y filtra las recetas de tu Excel."
     : activeView === "shopping"
       ? "Todos los ingredientes de las recetas elegidas para esta semana."
+      : activeView === "generator"
+        ? "Crea automáticamente una semana de comidas adaptada a tus preferencias."
       : "Una forma sencilla de convertir tu Excel en un menú semanal."}</p></div>
         <div class="top-actions"><button class="btn btn-quiet" id="export-menu">↧ <span>Exportar menú</span></button><button class="btn btn-quiet" id="clear-menu">Vaciar menú</button></div>
       </header>
-      ${activeView === "shopping" ? renderShoppingList() : activeView === "about" ? `<section class="panel about-panel"><h2>Cómo funciona</h2><ol><li>Sube un Excel con una sola hoja y las columnas de recetas.</li><li>Combina filtros por categoría, temporada, calorías, macros, notas o ingredientes.</li><li>En el menú semanal, pulsa «Añadir receta» en el día y la comida que quieras.</li><li>Exporta el menú a CSV para guardarlo o compartirlo.</li></ol><p>El archivo se procesa localmente en tu navegador. No se almacena en un servidor.</p></section>` : `
+      ${activeView === "shopping" ? renderShoppingList() : activeView === "generator"
+    ? renderGeneratorPanel() : activeView === "about" ? `<section class="panel about-panel"><h2>Cómo funciona</h2><ol><li>Sube un Excel con una sola hoja y las columnas de recetas.</li><li>Combina filtros por categoría, temporada, calorías, macros, notas o ingredientes.</li><li>En el menú semanal, pulsa «Añadir receta» en el día y la comida que quieras.</li><li>Exporta el menú a CSV para guardarlo o compartirlo.</li></ol><p>El archivo se procesa localmente en tu navegador. No se almacena en un servidor.</p></section>` : `
       <section class="panel filters-panel"><div class="section-title"><h2>⌘ Filtros</h2><button class="text-link" id="reset-filters">Restablecer</button></div>
         <div class="filters-grid">
           <label>Categoría<select id="filter-category">${optionList(categories, filters.category, "Todas")}</select></label>
@@ -1297,6 +2063,113 @@ function bindEvents() {
   };
 
   document.addEventListener("keydown", handleRecipeModalEscape);
+  // Configuración del generador automático.
+  app.querySelector("#generator-calories")?.addEventListener("change", e => {
+    generatorSettings.maxCalories = Math.max(
+      500,
+      Math.min(10000, Number(e.target.value) || 2000)
+    );
+
+    saveState();
+  });
+
+  app.querySelector("#generator-season")?.addEventListener("change", e => {
+    generatorSettings.season = e.target.value;
+    saveState();
+  });
+
+  [
+    ["generator-protein", "prioritizeProtein"],
+    ["generator-macros", "balanceMacros"],
+    ["generator-repeats", "avoidRepeats"],
+    ["generator-ingredients", "useCommonIngredients"]
+  ].forEach(([id, key]) => {
+    app.querySelector(`#${id}`)?.addEventListener("change", e => {
+      generatorSettings[key] = e.target.checked;
+      saveState();
+    });
+  });
+
+  app.querySelector("#generate-menu")?.addEventListener("click", () => {
+  const result = generateWeeklyMenu();
+
+  if (!result.success) {
+    alert(result.message);
+    return;
+  }
+
+  generatedMenu = result.menu;
+  render();
+});
+
+app.querySelector("#accept-generated-menu")?.addEventListener("click", () => {
+  if (!generatedMenu) return;
+
+  const confirmed = confirm(
+    "¿Quieres añadir las 21 comidas al menú semanal? Se sustituirán las comidas de esa semana."
+  );
+
+  if (!confirmed) return;
+
+  generatedMenu && Object.entries(generatedMenu).forEach(([day, meals]) => {
+    ["desayuno", "comida", "cena"].forEach(type => {
+      const mealName = type === "desayuno"
+        ? "Desayuno"
+        : type === "comida"
+          ? "Comida"
+          : "Cena";
+
+      const recipe = meals[type];
+
+      if (!recipe) return;
+
+      const key = slotKey(day, mealName);
+      menu[key] = [String(recipe.__id)];
+
+      recipeServings[servingKey(key, String(recipe.__id))] = 1;
+    });
+  });
+
+  checkedShoppingItems.clear();
+  selectedSlot = null;
+  activeView = "week";
+
+  saveState();
+  render();
+});
+
+app.querySelectorAll("[data-lock-recipe]").forEach(button => {
+  button.addEventListener("click", () => {
+    const recipeName = button.dataset.lockRecipe;
+
+    if (lockedRecipes.has(recipeName)) {
+      lockedRecipes.delete(recipeName);
+    } else {
+      lockedRecipes.add(recipeName);
+    }
+
+    button.classList.toggle("locked", lockedRecipes.has(recipeName));
+button.textContent = lockedRecipes.has(recipeName) ? "Bloqueada" : "Bloquear";
+saveState();
+  });
+});
+
+app.querySelectorAll("[data-regenerate-day]").forEach(button => {
+  button.addEventListener("click", () => {
+    const day = button.dataset.regenerateDay;
+    const type = button.dataset.regenerateType;
+
+    regenerateSingleMeal(day, type);
+  });
+});
+
+app.querySelectorAll("[data-regenerate-full-day]").forEach(button => {
+  button.addEventListener("click", () => {
+    const day = button.dataset.regenerateFullDay;
+    regenerateFullDay(day);
+  });
+});
+
   const connectDriveButton = app.querySelector("#connect-drive");
 if (connectDriveButton) {
   connectDriveButton.addEventListener("click", connectGoogleDrive);
